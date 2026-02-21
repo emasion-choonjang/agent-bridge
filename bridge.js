@@ -58,6 +58,19 @@ const COOLDOWN_MS = 5000;
 let lastInject = 0;
 const MAX_DEPTH = 3;
 
+// --- Build list of agents this bridge handles ---
+const localAgents = [AGENT];
+const extraAgentConfigs = {};
+if (EXTRA_AGENTS) {
+  for (const entry of EXTRA_AGENTS.split(",")) {
+    const [agentId] = entry.split(":");
+    if (agentId) {
+      localAgents.push(agentId.toLowerCase());
+      extraAgentConfigs[agentId.toLowerCase()] = true;
+    }
+  }
+}
+
 // --- Redis connections (need separate for sub + pub) ---
 const sub = new Redis(REDIS_OPTS);
 const pub = new Redis(REDIS_OPTS);
@@ -78,8 +91,30 @@ sub.on("message", (_ch, raw) => {
     return;
   }
 
-  // ignore own messages
-  if (msg.from === AGENT) return;
+  // ignore own messages (for non-echo)
+  if (msg.from === AGENT && msg.type !== "echo") return;
+
+  // --- Echo message handling ---
+  if (msg.type === "echo") {
+    // Don't echo own messages back to self
+    if (localAgents.includes(msg.from)) return;
+
+    const echoText = `[echo from:${msg.from}] ${msg.text}`;
+    const GROUP_ID = process.env.GROUP_ID || "-1003554423969";
+
+    // Inject echo as context to ALL local agents
+    for (const targetAgent of localAgents) {
+      const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", echoText, "--deliver"];
+      if (extraAgentConfigs[targetAgent]) {
+        args.splice(1, 0, "--agent", targetAgent);
+      }
+      execFile(OPENCLAW, args, { timeout: 60000, env: { ...process.env, PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" } }, (err, stdout) => {
+        if (err) console.error(`[${targetAgent}] Echo inject error:`, err.message);
+        else console.log(`[${targetAgent}] Echo from ${msg.from}: ${msg.text.slice(0, 50)}...`);
+      });
+    }
+    return;
+  }
 
   // depth guard
   if ((msg.depth || 0) >= MAX_DEPTH) return;
@@ -97,19 +132,6 @@ sub.on("message", (_ch, raw) => {
     sori: /소리|sori|SoRi/i,
     nichris: /니크리스|nichris|NiChris/i,
   };
-
-  // Build list of agents this bridge handles
-  const localAgents = [AGENT];
-  const extraAgentConfigs = {}; // agentId -> openclaw agent flag
-  if (EXTRA_AGENTS) {
-    for (const entry of EXTRA_AGENTS.split(",")) {
-      const [agentId] = entry.split(":");
-      if (agentId) {
-        localAgents.push(agentId.toLowerCase());
-        extraAgentConfigs[agentId.toLowerCase()] = true;
-      }
-    }
-  }
 
   // Find which local agents are mentioned
   const mentionedAgents = localAgents.filter((a) => {
@@ -133,7 +155,7 @@ sub.on("message", (_ch, raw) => {
       args.splice(1, 0, "--agent", targetAgent);
     }
 
-    execFile(OPENCLAW, args, { timeout: 60000 }, (err, stdout, stderr) => {
+    execFile(OPENCLAW, args, { timeout: 60000, env: { ...process.env, PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" } }, (err, stdout, stderr) => {
       if (err) console.error(`[${targetAgent}] Inject error:`, err.message);
       else console.log(`[${targetAgent}] Injected OK:`, stdout.slice(0, 100));
     });
