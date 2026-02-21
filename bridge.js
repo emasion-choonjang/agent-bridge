@@ -32,6 +32,7 @@ const MENTION_MAP = {
   choa: ['초아', '@choonjang_bot', '초아야', '초아한테', '초아가', '초아는', '초아도'],
   sera: ['세라', '@sera_choonjang_bot', '세라야', '세라한테', '세라가', '세라는', '세라도'],
   nicris: ['니크리스', '@nicrees_choonjang_bot', '니크리스한테', '니크리스가'],
+  sori: ['소리', '@sori_choonjang_bot', '소리야', '소리한테', '소리가', '소리는', '소리도'],
 };
 
 // --- State ---
@@ -71,8 +72,11 @@ function injectToOpenClaw(message, redis) {
   console.log(`[bridge] Injecting to OpenClaw: "${injectText.substring(0, 80)}..."`);
 
   try {
+    // Build args: route to the correct agent via --agent flag
+    const agentArgs = AGENT_ID !== 'sera' ? ['--agent', AGENT_ID] : [];
     const child = spawn(OPENCLAW_BIN, [
       'agent',
+      ...agentArgs,
       '-m', injectText,
       '--channel', 'telegram',
       '--to', TELEGRAM_GROUP,
