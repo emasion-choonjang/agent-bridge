@@ -53,7 +53,7 @@ function isMentioned(text, agentId) {
   return patterns.some(p => lower.includes(p.toLowerCase()));
 }
 
-function injectToOpenClaw(message) {
+function injectToOpenClaw(message, redis) {
   const now = Date.now();
   if (now - lastInjectTime < COOLDOWN_MS) {
     console.log(`[bridge] Cooldown active, skipping inject`);
@@ -82,9 +82,32 @@ function injectToOpenClaw(message) {
       timeout: 120000,
     });
 
-    child.stdout.on('data', d => console.log(`[openclaw] ${d.toString().trim()}`));
+    // Capture response and republish to Redis
+    let stdout = '';
+    child.stdout.on('data', d => {
+      const chunk = d.toString();
+      stdout += chunk;
+      console.log(`[openclaw] ${chunk.trim()}`);
+    });
     child.stderr.on('data', d => console.error(`[openclaw:err] ${d.toString().trim()}`));
-    child.on('close', code => console.log(`[openclaw] exited with code ${code}`));
+    child.on('close', code => {
+      console.log(`[openclaw] exited with code ${code}`);
+      // Republish response to Redis so other agents can see it
+      const response = stdout.trim();
+      if (response && code === 0) {
+        const nextDepth = depth + 1;
+        redis.xadd(STREAM, '*',
+          'from', AGENT_ID,
+          'text', response,
+          'timestamp', Date.now().toString(),
+          'depth', nextDepth.toString()
+        ).then(id => {
+          console.log(`[bridge] Republished response to Redis (${id}), depth=${nextDepth}`);
+        }).catch(err => {
+          console.error(`[bridge] Failed to republish:`, err.message);
+        });
+      }
+    });
   } catch (err) {
     console.error(`[bridge] Failed to inject:`, err.message);
   }
@@ -173,7 +196,7 @@ function processMessage(id, msg, redis) {
   // Check if this agent is mentioned
   if (isMentioned(msg.text || '', AGENT_ID)) {
     console.log(`[bridge] ${AGENT_ID} mentioned! Injecting...`);
-    injectToOpenClaw(msg);
+    injectToOpenClaw(msg, redis);
   }
 
   // Acknowledge message (mark as read)
