@@ -122,7 +122,7 @@ sub.on("message", (_ch, raw) => {
       // Skip if this agent is the sender (don't echo back to yourself)
       if (targetAgent === senderAgent) continue;
 
-      const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", echoText, "--deliver"];
+      const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", echoText];
       if (extraAgentConfigs[targetAgent]) {
         args.splice(1, 0, "--agent", targetAgent);
       }
