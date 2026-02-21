@@ -14,6 +14,8 @@
  *   REDIS_PASSWORD    — team Redis password
  *   OPENCLAW_BIN      — path to openclaw binary
  *   CHANNEL           — Redis pub/sub channel (default: "agent-bridge")
+ *   BOT_TOKEN         — Telegram bot token for auto-echo (main agent)
+ *   EXTRA_BOT_TOKENS  — extra agent bot tokens, format: "agentId:token,agentId2:token2"
  */
 
 const dns = require("dns");
@@ -36,6 +38,7 @@ try {
 
 const AGENT = (process.env.AGENT_NAME || "").toLowerCase();
 const CHANNEL = process.env.CHANNEL || "agent-bridge";
+const GROUP_ID = process.env.GROUP_ID || "-1003554423969";
 const REDIS_OPTS = {
   host: process.env.REDIS_HOST || "100.123.82.47",
   port: parseInt(process.env.REDIS_PORT || "6380", 10),
@@ -96,21 +99,29 @@ sub.on("message", (_ch, raw) => {
 
   // --- Echo message handling ---
   if (msg.type === "echo") {
-    // Don't echo own messages back to self (check agent id AND display names)
-    const selfNames = {
-      choa: ["choa", "초아", "choa"],
+    // Map agent names to their known aliases (for self-detection)
+    const agentAliases = {
+      choa: ["choa", "초아"],
       sera: ["sera", "세라"],
       sori: ["sori", "소리"],
       nichris: ["nichris", "니크리스"],
     };
-    const allLocalNames = localAgents.flatMap((a) => selfNames[a] || [a]);
-    if (allLocalNames.includes(msg.from.toLowerCase()) || localAgents.includes(msg.from.toLowerCase())) return;
+
+    // Find which local agent sent this echo (if any)
+    const senderLower = msg.from.toLowerCase();
+    const senderAgent = localAgents.find((a) => {
+      if (a === senderLower) return true;
+      const aliases = agentAliases[a] || [];
+      return aliases.includes(senderLower);
+    });
 
     const echoText = `[echo from:${msg.from}] ${msg.text}`;
-    const GROUP_ID = process.env.GROUP_ID || "-1003554423969";
 
-    // Inject echo as context to ALL local agents
+    // Inject echo to local agents EXCEPT the sender
     for (const targetAgent of localAgents) {
+      // Skip if this agent is the sender (don't echo back to yourself)
+      if (targetAgent === senderAgent) continue;
+
       const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", echoText, "--deliver"];
       if (extraAgentConfigs[targetAgent]) {
         args.splice(1, 0, "--agent", targetAgent);
@@ -148,7 +159,6 @@ sub.on("message", (_ch, raw) => {
 
   if (mentionedAgents.length === 0) return;
 
-  const GROUP_ID = process.env.GROUP_ID || "-1003554423969";
   const depth = (msg.depth || 0) + 1;
 
   for (const targetAgent of mentionedAgents) {
@@ -181,6 +191,91 @@ process.stdin.on("data", (chunk) => {
   const text = chunk.trim();
   if (text) publish(text);
 });
+
+// --- Telegram auto-echo: watch own bot messages in group ---
+const https = require("https");
+
+function telegramGet(token, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const qs = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+    const url = `https://api.telegram.org/bot${token}/${method}${qs ? "?" + qs : ""}`;
+    https.get(url, { family: 4 }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    }).on("error", reject);
+  });
+}
+
+async function startAutoEcho(agentName, token) {
+  let offset = 0;
+  // Get bot info to know bot's user id
+  const me = await telegramGet(token, "getMe");
+  if (!me.ok) {
+    console.error(`[auto-echo:${agentName}] getMe failed:`, me);
+    return;
+  }
+  const botId = me.result.id;
+  console.log(`[auto-echo:${agentName}] watching bot ${me.result.username} (${botId}) for group messages`);
+
+  const groupId = parseInt(GROUP_ID, 10);
+
+  async function poll() {
+    try {
+      const updates = await telegramGet(token, "getUpdates", {
+        offset,
+        timeout: 30,
+        allowed_updates: JSON.stringify(["message"]),
+      });
+      if (updates.ok && updates.result.length > 0) {
+        for (const upd of updates.result) {
+          offset = upd.update_id + 1;
+          const msg = upd.message;
+          if (!msg || !msg.text) continue;
+          // Only echo messages FROM this bot IN the target group
+          if (msg.from && msg.from.id === botId && msg.chat && msg.chat.id === groupId) {
+            const payload = JSON.stringify({
+              type: "echo",
+              from: agentName,
+              text: msg.text,
+              ts: Date.now(),
+            });
+            pub.publish(CHANNEL, payload);
+            console.log(`[auto-echo:${agentName}] published: ${msg.text.slice(0, 60)}...`);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[auto-echo:${agentName}] poll error:`, err.message);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    setTimeout(poll, 500);
+  }
+  poll();
+}
+
+// Start auto-echo for main agent
+if (process.env.BOT_TOKEN) {
+  startAutoEcho(AGENT, process.env.BOT_TOKEN).catch((e) =>
+    console.error(`[auto-echo:${AGENT}] start failed:`, e.message)
+  );
+}
+
+// Start auto-echo for extra agents
+if (process.env.EXTRA_BOT_TOKENS) {
+  for (const entry of process.env.EXTRA_BOT_TOKENS.split(",")) {
+    const colonIdx = entry.indexOf(":");
+    if (colonIdx > 0) {
+      const agentId = entry.slice(0, colonIdx).toLowerCase();
+      const token = entry.slice(colonIdx + 1);
+      startAutoEcho(agentId, token).catch((e) =>
+        console.error(`[auto-echo:${agentId}] start failed:`, e.message)
+      );
+    }
+  }
+}
 
 // --- graceful shutdown ---
 process.on("SIGINT", () => {
