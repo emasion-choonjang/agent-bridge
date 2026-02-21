@@ -1,9 +1,0 @@
-[dotenv@17.3.1] injecting env (0) from .env -- tip: ⚙️  load multiple .env files with { path: ['.env.local', '.env'] }
-[bridge] Starting agent bridge for: sori
-[bridge] Redis: redis://:***@100.123.82.47:6380
-[bridge] Stream: team-chat | Group: agent-sori | Consumer: sori
-[bridge] Redis connected
-[bridge] Created consumer group: agent-sori
-[bridge] Checking for pending messages...
-[bridge] Pending messages processed.
-[bridge] Listening for new messages...
