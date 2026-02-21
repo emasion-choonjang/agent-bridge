@@ -96,8 +96,15 @@ sub.on("message", (_ch, raw) => {
 
   // --- Echo message handling ---
   if (msg.type === "echo") {
-    // Don't echo own messages back to self
-    if (localAgents.includes(msg.from)) return;
+    // Don't echo own messages back to self (check agent id AND display names)
+    const selfNames = {
+      choa: ["choa", "초아", "choa"],
+      sera: ["sera", "세라"],
+      sori: ["sori", "소리"],
+      nichris: ["nichris", "니크리스"],
+    };
+    const allLocalNames = localAgents.flatMap((a) => selfNames[a] || [a]);
+    if (allLocalNames.includes(msg.from.toLowerCase()) || localAgents.includes(msg.from.toLowerCase())) return;
 
     const echoText = `[echo from:${msg.from}] ${msg.text}`;
     const GROUP_ID = process.env.GROUP_ID || "-1003554423969";
