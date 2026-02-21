@@ -1,227 +1,172 @@
 #!/usr/bin/env node
 /**
- * Agent Bridge — Redis Streams relay for OpenClaw agent-to-agent communication
- * 
- * Uses Redis Streams (not pub/sub) for:
- * - Persistent message history
- * - Consumer groups with last-read tracking (no duplicate reads)
- * - Offline message recovery
- * 
- * Usage: AGENT_ID=choa node bridge.js
+ * Agent Bridge — Redis pub/sub relay for inter-agent communication.
+ *
+ * Each OpenClaw instance runs this script.  When a Telegram group message
+ * mentions another agent, the bridge publishes it to Redis.  The remote
+ * bridge instance picks it up and injects it into its local OpenClaw agent
+ * via `openclaw agent -m`.
+ *
+ * Env vars (or .env):
+ *   AGENT_NAME        — this agent's name, e.g. "choa" or "sera"
+ *   REDIS_HOST        — team Redis host (default: 100.123.82.47)
+ *   REDIS_PORT        — team Redis port (default: 6380)
+ *   REDIS_PASSWORD    — team Redis password
+ *   OPENCLAW_BIN      — path to openclaw binary
+ *   CHANNEL           — Redis pub/sub channel (default: "agent-bridge")
  */
 
-require('dotenv').config();
-const Redis = require('ioredis');
-const { spawn } = require('child_process');
-const path = require('path');
+const dns = require("dns");
+dns.setDefaultResultOrder("ipv4first");
+const { execFile } = require("child_process");
+const Redis = require("ioredis");
+const path = require("path");
 
-// --- Config ---
-const AGENT_ID = process.env.AGENT_ID || 'choa';
-const REDIS_URL = process.env.REDIS_URL || 'redis://:choonjang-team-2026@100.123.82.47:6380';
-const STREAM = 'team-chat';
-const GROUP = `agent-${AGENT_ID}`;    // Each agent gets its OWN group (broadcast, not distributed)
-const CONSUMER = AGENT_ID;            // Consumer within the group
-const OPENCLAW_BIN = process.env.OPENCLAW_BIN || findOpenClaw();
-const TELEGRAM_GROUP = process.env.TELEGRAM_GROUP || '-1003554423969';
-const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || '5000');
-const MAX_DEPTH = parseInt(process.env.MAX_DEPTH || '3');
-const POLL_INTERVAL_MS = 500;         // Stream poll interval
+// --- load .env if present ---
+try {
+  const fs = require("fs");
+  const envPath = path.join(__dirname, ".env");
+  if (fs.existsSync(envPath)) {
+    for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
+      const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.+?)\s*$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    }
+  }
+} catch {}
 
-// Agent mention patterns
-const MENTION_MAP = {
-  choa: ['초아', '@choonjang_bot', '초아야', '초아한테', '초아가', '초아는', '초아도'],
-  sera: ['세라', '@sera_choonjang_bot', '세라야', '세라한테', '세라가', '세라는', '세라도'],
-  nicris: ['니크리스', '@nicrees_choonjang_bot', '니크리스한테', '니크리스가'],
+const AGENT = (process.env.AGENT_NAME || "").toLowerCase();
+const CHANNEL = process.env.CHANNEL || "agent-bridge";
+const REDIS_OPTS = {
+  host: process.env.REDIS_HOST || "100.123.82.47",
+  port: parseInt(process.env.REDIS_PORT || "6380", 10),
+  password: process.env.REDIS_PASSWORD || "",
+  retryStrategy: (times) => Math.min(times * 1000, 30000),
 };
+const OPENCLAW = process.env.OPENCLAW_BIN || "openclaw";
 
-// --- State ---
-let lastInjectTime = 0;
+// Multi-agent routing: EXTRA_AGENTS="sori:소리|sori|SoRi"
+// Format: "agentId:pattern1|pattern2,agentId2:pattern1|pattern2"
+const EXTRA_AGENTS = process.env.EXTRA_AGENTS || "";
 
-function findOpenClaw() {
+if (!AGENT) {
+  console.error("AGENT_NAME is required");
+  process.exit(1);
+}
+
+// --- loop prevention ---
+const COOLDOWN_MS = 5000;
+let lastInject = 0;
+const MAX_DEPTH = 3;
+
+// --- Redis connections (need separate for sub + pub) ---
+const sub = new Redis(REDIS_OPTS);
+const pub = new Redis(REDIS_OPTS);
+
+sub.subscribe(CHANNEL, (err) => {
+  if (err) {
+    console.error("Subscribe error:", err.message);
+    process.exit(1);
+  }
+  console.log(`[${AGENT}] subscribed to ${CHANNEL}`);
+});
+
+sub.on("message", (_ch, raw) => {
+  let msg;
   try {
-    const { execSync } = require('child_process');
-    return execSync('which openclaw 2>/dev/null || find ~/.nvm -name openclaw -type f 2>/dev/null | head -1',
-      { encoding: 'utf-8' }).trim();
+    msg = JSON.parse(raw);
   } catch {
-    return path.join(process.env.HOME, '.nvm/versions/node/v22.19.0/bin/openclaw');
+    return;
   }
-}
 
-function isMentioned(text, agentId) {
-  const patterns = MENTION_MAP[agentId] || [];
-  const lower = text.toLowerCase();
-  return patterns.some(p => lower.includes(p.toLowerCase()));
-}
+  // ignore own messages
+  if (msg.from === AGENT) return;
 
-function injectToOpenClaw(message, redis) {
+  // depth guard
+  if ((msg.depth || 0) >= MAX_DEPTH) return;
+
+  // cooldown
   const now = Date.now();
-  if (now - lastInjectTime < COOLDOWN_MS) {
-    console.log(`[bridge] Cooldown active, skipping inject`);
-    return;
-  }
-  lastInjectTime = now;
+  if (now - lastInject < COOLDOWN_MS) return;
+  lastInject = now;
 
-  const depth = parseInt(message.depth || '0');
-  if (depth >= MAX_DEPTH) {
-    console.log(`[bridge] Max depth ${MAX_DEPTH} reached, skipping`);
-    return;
-  }
+  // check if this message mentions any local agent
+  const text = msg.text || "";
+  const mentionPatterns = {
+    choa: /초아|choa|ChoA/i,
+    sera: /세라|sera|SeRA/i,
+    sori: /소리|sori|SoRi/i,
+    nichris: /니크리스|nichris|NiChris/i,
+  };
 
-  const injectText = `[Agent Bridge - ${message.from} said in group]: ${message.text}`;
-  console.log(`[bridge] Injecting to OpenClaw: "${injectText.substring(0, 80)}..."`);
-
-  try {
-    const child = spawn(OPENCLAW_BIN, [
-      'agent',
-      '-m', injectText,
-      '--channel', 'telegram',
-      '--to', TELEGRAM_GROUP,
-      '--deliver',
-    ], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 120000,
-    });
-
-    // Capture response and republish to Redis
-    let stdout = '';
-    child.stdout.on('data', d => {
-      const chunk = d.toString();
-      stdout += chunk;
-      console.log(`[openclaw] ${chunk.trim()}`);
-    });
-    child.stderr.on('data', d => console.error(`[openclaw:err] ${d.toString().trim()}`));
-    child.on('close', code => {
-      console.log(`[openclaw] exited with code ${code}`);
-      // Republish response to Redis so other agents can see it
-      const response = stdout.trim();
-      if (response && code === 0) {
-        const nextDepth = depth + 1;
-        redis.xadd(STREAM, '*',
-          'from', AGENT_ID,
-          'text', response,
-          'timestamp', Date.now().toString(),
-          'depth', nextDepth.toString()
-        ).then(id => {
-          console.log(`[bridge] Republished response to Redis (${id}), depth=${nextDepth}`);
-        }).catch(err => {
-          console.error(`[bridge] Failed to republish:`, err.message);
-        });
+  // Build list of agents this bridge handles
+  const localAgents = [AGENT];
+  const extraAgentConfigs = {}; // agentId -> openclaw agent flag
+  if (EXTRA_AGENTS) {
+    for (const entry of EXTRA_AGENTS.split(",")) {
+      const [agentId] = entry.split(":");
+      if (agentId) {
+        localAgents.push(agentId.toLowerCase());
+        extraAgentConfigs[agentId.toLowerCase()] = true;
       }
-    });
-  } catch (err) {
-    console.error(`[bridge] Failed to inject:`, err.message);
+    }
   }
-}
 
-// --- Main ---
-async function main() {
-  console.log(`[bridge] Starting agent bridge for: ${AGENT_ID}`);
-  console.log(`[bridge] Redis: ${REDIS_URL.replace(/:[^:@]+@/, ':***@')}`);
-  console.log(`[bridge] Stream: ${STREAM} | Group: ${GROUP} | Consumer: ${CONSUMER}`);
-
-  const redis = new Redis(REDIS_URL, {
-    retryStrategy: (times) => Math.min(times * 500, 5000),
-    maxRetriesPerRequest: null,
+  // Find which local agents are mentioned
+  const mentionedAgents = localAgents.filter((a) => {
+    const p = mentionPatterns[a];
+    return p && p.test(text);
   });
 
-  redis.on('connect', () => console.log('[bridge] Redis connected'));
-  redis.on('error', err => console.error('[bridge] Redis error:', err.message));
+  if (mentionedAgents.length === 0) return;
 
-  // Create stream & consumer group (ignore if already exists)
-  try {
-    await redis.xgroup('CREATE', STREAM, GROUP, '0', 'MKSTREAM');
-    console.log(`[bridge] Created consumer group: ${GROUP}`);
-  } catch (err) {
-    if (err.message.includes('BUSYGROUP')) {
-      console.log(`[bridge] Consumer group already exists: ${GROUP}`);
-    } else {
-      throw err;
+  const GROUP_ID = process.env.GROUP_ID || "-1003554423969";
+  const depth = (msg.depth || 0) + 1;
+
+  for (const targetAgent of mentionedAgents) {
+    console.log(`[${targetAgent}] injecting message from ${msg.from}: ${text.slice(0, 80)}...`);
+
+    const injectText = `[agent-bridge from:${msg.from} depth:${depth}] ${text}`;
+    
+    // For extra agents, use --agent flag to route to specific agent
+    const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", injectText, "--deliver"];
+    if (extraAgentConfigs[targetAgent]) {
+      args.splice(1, 0, "--agent", targetAgent);
     }
+
+    execFile(OPENCLAW, args, { timeout: 60000 }, (err, stdout, stderr) => {
+      if (err) console.error(`[${targetAgent}] Inject error:`, err.message);
+      else console.log(`[${targetAgent}] Injected OK:`, stdout.slice(0, 100));
+    });
   }
+});
 
-  // First: process any pending (unacknowledged) messages from previous runs
-  console.log('[bridge] Checking for pending messages...');
-  let pending = true;
-  while (pending) {
-    const results = await redis.xreadgroup('GROUP', GROUP, CONSUMER, 'COUNT', 10, 'STREAMS', STREAM, '0');
-    if (!results || results[0][1].length === 0) {
-      pending = false;
-      break;
-    }
-    for (const [id, fields] of results[0][1]) {
-      processMessage(id, fieldsToObject(fields), redis);
-    }
-  }
-  console.log('[bridge] Pending messages processed.');
-
-  // Main loop: read new messages with blocking
-  console.log('[bridge] Listening for new messages...');
-  while (true) {
-    try {
-      const results = await redis.xreadgroup(
-        'GROUP', GROUP, CONSUMER,
-        'COUNT', 5,
-        'BLOCK', POLL_INTERVAL_MS,
-        'STREAMS', STREAM, '>'
-      );
-
-      if (results) {
-        for (const [id, fields] of results[0][1]) {
-          processMessage(id, fieldsToObject(fields), redis);
-        }
-      }
-    } catch (err) {
-      if (err.message.includes('NOGROUP')) {
-        // Group was deleted, recreate
-        try {
-          await redis.xgroup('CREATE', STREAM, GROUP, '$', 'MKSTREAM');
-        } catch {}
-      } else {
-        console.error('[bridge] Read error:', err.message);
-        await sleep(1000);
-      }
-    }
-  }
+// --- publish helper (call from outside or extend) ---
+function publish(text, depth = 0) {
+  const payload = JSON.stringify({ from: AGENT, text, depth, ts: Date.now() });
+  pub.publish(CHANNEL, payload);
 }
 
-function processMessage(id, msg, redis) {
-  // Skip own messages
-  if (msg.from === AGENT_ID) {
-    redis.xack(STREAM, GROUP, id);
-    return;
-  }
+// --- stdin listener for manual publish (pipe messages in) ---
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  const text = chunk.trim();
+  if (text) publish(text);
+});
 
-  console.log(`[bridge] [${id}] From ${msg.from}: "${(msg.text || '').substring(0, 60)}..."`);
-
-  // Check if this agent is mentioned
-  if (isMentioned(msg.text || '', AGENT_ID)) {
-    console.log(`[bridge] ${AGENT_ID} mentioned! Injecting...`);
-    injectToOpenClaw(msg, redis);
-  }
-
-  // Acknowledge message (mark as read)
-  redis.xack(STREAM, GROUP, id);
-}
-
-function fieldsToObject(fields) {
-  const obj = {};
-  for (let i = 0; i < fields.length; i += 2) {
-    obj[fields[i]] = fields[i + 1];
-  }
-  return obj;
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('[bridge] Shutting down...');
+// --- graceful shutdown ---
+process.on("SIGINT", () => {
+  console.log("Shutting down...");
+  sub.disconnect();
+  pub.disconnect();
   process.exit(0);
 });
 
-main().catch(err => {
-  console.error('[bridge] Fatal error:', err);
-  process.exit(1);
+process.on("SIGTERM", () => {
+  sub.disconnect();
+  pub.disconnect();
+  process.exit(0);
 });
+
+console.log(`[${AGENT}] bridge running — Redis ${REDIS_OPTS.host}:${REDIS_OPTS.port}`);
+
+module.exports = { publish };
