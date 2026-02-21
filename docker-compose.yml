@@ -1,0 +1,16 @@
+# Team Redis for agent-to-agent communication
+# Deploy on Mac Mini (choonjang-server)
+# Accessible via Tailscale IP only
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: team-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-choonjang-team-2026}
+    ports:
+      - "0.0.0.0:6380:6379"  # Port 6380 to avoid conflict with kr-stock-bot Redis (6379)
+    volumes:
+      - team-redis-data:/data
+
+volumes:
+  team-redis-data:
