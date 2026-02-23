@@ -137,12 +137,12 @@ sub.on("message", (_ch, raw) => {
       if (targetAgent === senderAgent) continue;
 
       const sid = targetAgent === AGENT ? SESSION_ID : extraSessionIds[targetAgent];
-      const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", echoText, "--deliver"];
+      const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", echoText, "--deliver", "--thinking", "off", "--timeout", "120"];
       if (sid) args.push("--session-id", sid);
       if (extraAgentConfigs[targetAgent]) {
         args.splice(1, 0, "--agent", targetAgent);
       }
-      execFile(OPENCLAW, args, { timeout: 60000, env: { ...process.env, PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" } }, (err, stdout) => {
+      execFile(OPENCLAW, args, { timeout: 180000, env: { ...process.env, PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" } }, (err, stdout) => {
         if (err) console.error(`[${targetAgent}] Echo inject error:`, err.message);
         else console.log(`[${targetAgent}] Echo from ${msg.from}: ${msg.text.slice(0, 50)}...`);
       });
@@ -183,13 +183,13 @@ sub.on("message", (_ch, raw) => {
     const injectText = `[agent-bridge from:${msg.from} depth:${depth}] ${text}`;
     
     const sid = targetAgent === AGENT ? SESSION_ID : extraSessionIds[targetAgent];
-    const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", injectText, "--deliver"];
+    const args = ["agent", "--channel", "telegram", "--to", GROUP_ID, "-m", injectText, "--deliver", "--thinking", "off", "--timeout", "120"];
     if (sid) args.push("--session-id", sid);
     if (extraAgentConfigs[targetAgent]) {
       args.splice(1, 0, "--agent", targetAgent);
     }
 
-    execFile(OPENCLAW, args, { timeout: 60000, env: { ...process.env, PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" } }, (err, stdout, stderr) => {
+    execFile(OPENCLAW, args, { timeout: 180000, env: { ...process.env, PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" } }, (err, stdout, stderr) => {
       if (err) console.error(`[${targetAgent}] Inject error:`, err.message);
       else console.log(`[${targetAgent}] Injected OK:`, stdout.slice(0, 100));
     });
